@@ -106,6 +106,10 @@ button:disabled { opacity: .35; cursor: default; }
 button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .note { color: var(--muted); font-size: .9rem; margin-top: 1.5rem; }
+.role { color: var(--muted); font-size: .9rem; margin: .75rem 0 0; }
+.locked input { background: transparent; border-color: transparent; }
+#total[readonly] { background: transparent; border-color: transparent; padding-left: 0; }
+.amount.done + .sub { color: var(--accent); font-weight: 600; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -159,6 +163,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); ou
           <button type="button" id="new-bill" data-i18n="newBill"></button>
         </div>
       </div>
+      <p class="role" id="role"></p>
     </section>
 
     <section class="panel">
@@ -229,7 +234,11 @@ const I18N = {
     owes: "owes",
     leftToAssign: "Left to assign",
     overBy: "Over the bill by",
-    allAssigned: "Everything’s assigned",
+    allAssigned: "Balance is zero",
+    readyToPay: "Everyone’s covered. Call the waiter and pay!",
+    roleOrganiser: "You started this bill, so you can change the total, the service and everyone’s rows.",
+    roleGuest: "You can edit your own row. The person who started the bill sets the total and service.",
+    notAllowed: "Only the person who started the bill can change that.",
     assignedSoFar: "Assigned so far",
     typeTotal: "Type the bill total to see what’s left",
     summary: (total, withService, tip) => `of a ${total} bill, which comes to ${withService} with ${tip}% service`,
@@ -244,7 +253,7 @@ const I18N = {
     removePerson: n => `Remove person ${n}`,
     tipDown: "Lower service by 0.5%",
     tipUp: "Raise service by 0.5%",
-    note: "Everyone with the link can add and change entries, and the page updates every few seconds. To add up items, type them with + (for example 12.50+4+3.20) or tap the + button. To get one item from a line like “Coca-Cola 3 11.25”, type 11.25/3 or tap ÷. Service is shared in proportion to what each person spent."
+    note: "Everyone adds their own row, and the person who started the bill can fix anyone’s. The page updates every few seconds. To add up items, type them with + (for example 12.50+4+3.20) or tap the + button. To get one item from a line like “Coca-Cola 3 11.25”, type 11.25/3 or tap ÷. Service is shared in proportion to what each person spent."
   },
   es: {
     htmlLang: "es",
@@ -277,7 +286,11 @@ const I18N = {
     owes: "debe",
     leftToAssign: "Falta por asignar",
     overBy: "Se pasa de la cuenta por",
-    allAssigned: "Todo asignado",
+    allAssigned: "Saldo en cero",
+    readyToPay: "Ya está todo cubierto. ¡Llamen al camarero y a pagar!",
+    roleOrganiser: "Tú empezaste esta cuenta, así que puedes cambiar el total, el servicio y las filas de todos.",
+    roleGuest: "Puedes editar tu propia fila. Quien empezó la cuenta pone el total y el servicio.",
+    notAllowed: "Solo quien empezó la cuenta puede cambiar eso.",
     assignedSoFar: "Asignado hasta ahora",
     typeTotal: "Escribe el total de la cuenta para ver lo que falta",
     summary: (total, withService, tip) => `de una cuenta de ${total}, que queda en ${withService} con ${tip}% de servicio`,
@@ -292,7 +305,7 @@ const I18N = {
     removePerson: n => `Quitar a la persona ${n}`,
     tipDown: "Bajar el servicio un 0,5%",
     tipUp: "Subir el servicio un 0,5%",
-    note: "Cualquiera con el enlace puede añadir y cambiar importes, y la página se actualiza cada pocos segundos. Para sumar, escribe los importes con + (por ejemplo 12.50+4+3.20) o toca el botón +. Para sacar una unidad de una línea como «Coca-Cola 3 11.25», escribe 11.25/3 o toca ÷. El servicio se reparte según lo que gastó cada persona."
+    note: "Cada uno añade su propia fila, y quien empezó la cuenta puede corregir la de cualquiera. La página se actualiza cada pocos segundos. Para sumar, escribe los importes con + (por ejemplo 12.50+4+3.20) o toca el botón +. Para sacar una unidad de una línea como «Coca-Cola 3 11.25», escribe 11.25/3 o toca ÷. El servicio se reparte según lo que gastó cada persona."
   }
 };
 
@@ -310,7 +323,8 @@ const store = {
 };
 const randomFrom = (chars, n) => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => chars[b % chars.length]).join("");
 const newCode = () => randomFrom(ALPHABET, 5);
-const newId = () => randomFrom("abcdefghijklmnopqrstuvwxyz0123456789", 12);
+const newId = (n = 12) => randomFrom("abcdefghijklmnopqrstuvwxyz0123456789", n);
+const newKey = () => newId(32);   // secret: proves "I'm the organiser" or "this row is mine"
 const clean = v => v.replace(/[^0-9.,+\/* ]/g, "");
 const num = s => { const n = parseFloat(String(s).replace(",", ".").replace(/[^0-9.]/g, "")); return isNaN(n) ? null : n; };
 // "12.50+11.25/3" = 12.50 + (11.25 ÷ 3). Unfinished bits like "11.25/" are ignored while typing.
@@ -341,6 +355,10 @@ const pending = new Map();       // id or "meta" -> timer; local edits not yet s
 const removing = new Set();      // ids deleted here, hidden until the server catches up
 let pollTimer = null;
 let meId = null;
+let adminKey = null;             // only on the organiser's phone
+let owned = {};                  // rows this phone created: { personId: ownerKey }
+const isOrganiser = () => !!adminKey;
+const canEdit = id => isOrganiser() || !!owned[id];
 
 const fmt = n => n.toLocaleString("en-GB", { style: "currency", currency: meta.currency, currencyDisplay: "narrowSymbol" });
 
@@ -348,7 +366,7 @@ async function post(body) {
   const r = await fetch(API, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, ...body })
+    body: JSON.stringify({ code, adminKey: adminKey || undefined, ...body })
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) { const e = new Error(data.error || r.status); e.code = data.error; throw e; }
@@ -369,6 +387,7 @@ async function saveMeta() {
     if (pending.get("meta") === token) pending.delete("meta");
     setStatus("");
   } catch (e) {
+    if (e.code === "forbidden") { pending.delete("meta"); setStatus(t("notAllowed")); fetchBill(); return; }
     setStatus(t("offline"));
     if (pending.get("meta") === token) queueSave("meta", 3000);
   }
@@ -378,11 +397,12 @@ async function savePerson(id) {
   const p = people.find(x => x.id === id);
   if (!p) { pending.delete(id); return; }
   try {
-    await post({ action: "person", id, initials: p.initials, spent: p.spent });
+    await post({ action: "person", id, ownerKey: owned[id], initials: p.initials, spent: p.spent });
     if (pending.get(id) === token) pending.delete(id);
     setStatus("");
   } catch (e) {
     if (e.code === "full") { pending.delete(id); people = people.filter(x => x.id !== id); setStatus(t("full")); render(); return; }
+    if (e.code === "forbidden") { pending.delete(id); setStatus(t("notAllowed")); fetchBill(); return; }
     setStatus(t("offline"));
     if (pending.get(id) === token) queueSave(id, 3000);
   }
@@ -440,6 +460,8 @@ function openBill(c) {
   code = c;
   people = []; pending.clear(); removing.clear();
   meId = store.get(`split-me-${c}`);
+  adminKey = store.get(`split-admin-${c}`);
+  owned = store.get(`split-owned-${c}`) || {};
   $("home").hidden = true; $("bill").hidden = false;
   $("code").textContent = c;
   $("rows").innerHTML = "";
@@ -461,13 +483,14 @@ async function startBill() {
   }
   for (let attempt = 0; attempt < (chosen ? 1 : 3); attempt++) {
     const c = chosen || newCode();
+    const key = newKey();
     try {
       const r = await fetch(API, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code: c, action: "create", meta: { total: "", tip: prefs.tip ?? 12.5, currency: prefs.currency || "GBP" } })
+        body: JSON.stringify({ code: c, action: "create", adminKey: key, meta: { total: "", tip: prefs.tip ?? 12.5, currency: prefs.currency || "GBP" } })
       });
-      if (r.ok) { $("new-code").value = ""; location.hash = c; return; }
+      if (r.ok) { store.set(`split-admin-${c}`, key); $("new-code").value = ""; location.hash = c; return; }
       if (r.status === 409 && chosen) {     // their own name is in use today
         $("home-error").textContent = t("codeTaken");
         $("start").disabled = false;
@@ -504,6 +527,8 @@ function flash(msg) {
 function addPerson(isMe) {
   const p = { id: newId(), initials: "", spent: "", createdAt: Date.now() };
   people.push(p);
+  owned[p.id] = newKey();
+  store.set(`split-owned-${code}`, owned);
   if (isMe) { meId = p.id; store.set(`split-me-${code}`, meId); }
   queueSave(p.id, 0);
   render();
@@ -516,7 +541,12 @@ async function removePerson(id) {
   clearTimeout(pending.get(id)); pending.delete(id);
   people = people.filter(p => p.id !== id);
   render();
-  try { await post({ action: "remove", id }); } catch (e) { setStatus(t("offline")); }
+  try { await post({ action: "remove", id, ownerKey: owned[id] }); }
+  catch (e) {
+    removing.delete(id);
+    setStatus(e.code === "forbidden" ? t("notAllowed") : t("offline"));
+    fetchBill();
+  }
   setTimeout(() => removing.delete(id), 10000);
 }
 
@@ -586,6 +616,11 @@ function render() {
     if (document.activeElement !== ini && ini.value !== p.initials) ini.value = p.initials;
     if (document.activeElement !== sp && sp.value !== p.spent) sp.value = p.spent;
     ini.placeholder = String.fromCharCode(65 + (i % 26));
+    const editable = canEdit(p.id);
+    row.classList.toggle("locked", !editable);
+    ini.readOnly = sp.readOnly = !editable;
+    row.querySelector(".plus").hidden = row.querySelector(".divide").hidden = row.querySelector(".remove").hidden = !editable;
+    if (!editable) sp.placeholder = "";
     row.querySelector('[data-role="ini-label"]').textContent = t("initialsFor")(n);
     row.querySelector('[data-role="sp-label"]').textContent = t("spentBy")(n);
     row.querySelector(".plus").setAttribute("aria-label", t("addItem")(n));
@@ -605,6 +640,9 @@ function render() {
 
   $("empty").hidden = people.length > 0;
   $("add-me").hidden = !!meId && people.some(p => p.id === meId);
+  $("add-other").hidden = !isOrganiser();
+  $("role").textContent = isOrganiser() ? t("roleOrganiser") : t("roleGuest");
+  $("total").readOnly = !isOrganiser();
 
   const totalInput = $("total");
   if (document.activeElement !== totalInput && totalInput.value !== meta.total) totalInput.value = meta.total;
@@ -621,14 +659,18 @@ function render() {
     if (left > 0) { $("hero-label").textContent = t("leftToAssign"); hero.textContent = fmt(left); }
     else if (left < 0) { $("hero-label").textContent = t("overBy"); hero.textContent = fmt(-left); hero.classList.add("over"); }
     else { $("hero-label").textContent = t("allAssigned"); hero.textContent = fmt(0); hero.classList.add("done"); }
-    $("summary").textContent = t("summary")(fmt(total), fmt(total * factor), meta.tip);
+    $("summary").textContent = left === 0 && people.length
+      ? t("readyToPay")
+      : t("summary")(fmt(total), fmt(total * factor), meta.tip);
   }
 
   $("tip").textContent = meta.tip ? meta.tip + "%" : t("none");
-  $("tip-down").disabled = meta.tip <= 0;
-  $("tip-up").disabled = meta.tip >= 30;
-  document.querySelectorAll("#currency button").forEach(b =>
-    b.setAttribute("aria-pressed", String(b.dataset.currency === meta.currency)));
+  $("tip-down").disabled = !isOrganiser() || meta.tip <= 0;
+  $("tip-up").disabled = !isOrganiser() || meta.tip >= 30;
+  document.querySelectorAll("#currency button").forEach(b => {
+    b.setAttribute("aria-pressed", String(b.dataset.currency === meta.currency));
+    b.disabled = !isOrganiser() && b.dataset.currency !== meta.currency;
+  });
 }
 
 function applyLanguage() {
@@ -649,6 +691,7 @@ function applyLanguage() {
 
 // ---------- Wiring ----------
 function changeMeta(patch) {
+  if (!isOrganiser()) return;
   Object.assign(meta, patch);
   store.set("split-prefs", { tip: meta.tip, currency: meta.currency });
   queueSave("meta");

@@ -6,6 +6,7 @@ import { getStore } from "@netlify/blobs";
 const CODE = /^[A-Z0-9]{5}$/;
 const REUSE_AFTER_MS = 24 * 60 * 60 * 1000; // a code can be used again 24h after its bill started
 const ID = /^[a-z0-9]{8,20}$/;
+const KEY = /^[a-z0-9]{16,64}$/;
 const CURRENCIES = ["GBP", "EUR", "USD"];
 const MAX_PEOPLE = 40;
 
@@ -14,6 +15,16 @@ const json = (data, status = 200) =>
     status,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
+
+// Secret keys never get stored as-is, only their SHA-256 hash
+const sha256 = async text => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const keyMatches = async (key, hash) => !!hash && KEY.test(String(key || "")) && (await sha256(key)) === hash;
+// What phones are allowed to see: never the hashes
+const publicMeta = m => ({ total: m.total, tip: m.tip, currency: m.currency, createdAt: m.createdAt });
+const publicPerson = p => ({ id: p.id, initials: p.initials, spent: p.spent, createdAt: p.createdAt });
 
 const cleanAmount = v => String(v ?? "").replace(/[^0-9.,+\/* ]/g, "").slice(0, 120);
 const cleanInitials = v => String(v ?? "").toUpperCase().replace(/[^\p{L}\p{N}]/gu, "").slice(0, 3);
@@ -39,7 +50,7 @@ export default async req => {
     const people = (await Promise.all(blobs.map(b => store.get(b.key, { type: "json" }))))
       .filter(Boolean)
       .sort((a, b) => a.createdAt - b.createdAt);
-    return json({ meta, people });
+    return json({ meta: publicMeta(meta), people: people.map(publicPerson) });
   }
 
   if (req.method !== "POST") return json({ error: "method" }, 405);
@@ -51,6 +62,7 @@ export default async req => {
   const metaKey = `${code}/meta`;
 
   if (body.action === "create") {
+    if (!KEY.test(String(body.adminKey || ""))) return json({ error: "bad_key" }, 400);
     const old = await store.get(metaKey, { type: "json" });
     if (old) {
       if (Date.now() - (old.createdAt || 0) < REUSE_AFTER_MS) return json({ error: "exists" }, 409);
@@ -58,15 +70,19 @@ export default async req => {
       const { blobs } = await store.list({ prefix: `${code}/` });
       await Promise.all(blobs.map(b => store.delete(b.key)));
     }
-    await store.setJSON(metaKey, { ...cleanMeta(body.meta), createdAt: Date.now() });
+    await store.setJSON(metaKey, { ...cleanMeta(body.meta), adminHash: await sha256(body.adminKey), createdAt: Date.now() });
     return json({ ok: true });
   }
 
   const meta = await store.get(metaKey, { type: "json" });
   if (!meta) return json({ error: "not_found" }, 404);
+  // the organiser (whoever created the bill) holds the admin key; bills from before this change have no key
+  const isOrganiser = !meta.adminHash || (await keyMatches(body.adminKey, meta.adminHash));
+  const forbidden = () => json({ error: "forbidden" }, 403);
 
   if (body.action === "meta") {
-    await store.setJSON(metaKey, { ...cleanMeta(body.meta), createdAt: meta.createdAt });
+    if (!isOrganiser) return forbidden();
+    await store.setJSON(metaKey, { ...cleanMeta(body.meta), adminHash: meta.adminHash, createdAt: meta.createdAt });
     return json({ ok: true });
   }
 
@@ -76,7 +92,11 @@ export default async req => {
 
   if (body.action === "person") {
     const existing = await store.get(key, { type: "json" });
-    if (!existing) {
+    if (existing) {
+      // only the row's owner or the organiser can change it
+      if (!isOrganiser && !(await keyMatches(body.ownerKey, existing.ownerHash))) return forbidden();
+    } else {
+      if (!KEY.test(String(body.ownerKey || ""))) return json({ error: "bad_key" }, 400);
       const { blobs } = await store.list({ prefix: `${code}/people/` });
       if (blobs.length >= MAX_PEOPLE) return json({ error: "full" }, 409);
     }
@@ -84,12 +104,15 @@ export default async req => {
       id,
       initials: cleanInitials(body.initials),
       spent: cleanAmount(body.spent),
+      ownerHash: existing ? existing.ownerHash : await sha256(body.ownerKey),
       createdAt: existing?.createdAt ?? Date.now(),
     });
     return json({ ok: true });
   }
 
   if (body.action === "remove") {
+    const existing = await store.get(key, { type: "json" });
+    if (existing && !isOrganiser && !(await keyMatches(body.ownerKey, existing.ownerHash))) return forbidden();
     await store.delete(key);
     return json({ ok: true });
   }
