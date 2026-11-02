@@ -99,7 +99,9 @@ button:disabled { opacity: .35; cursor: default; }
 .join { margin-top: 1.5rem; }
 .join label { display: block; font-weight: 600; margin-bottom: .4rem; }
 .join-row { display: grid; grid-template-columns: 1fr auto; gap: .5rem; }
-#join-code { text-transform: uppercase; letter-spacing: .12em; font-weight: 600; }
+.code-input { text-transform: uppercase; letter-spacing: .12em; font-weight: 600; }
+.field-label { display: block; font-weight: 600; margin-bottom: .4rem; }
+.hint { color: var(--muted); font-size: .9rem; margin: .4rem 0 1rem; }
 .error { color: var(--danger); min-height: 1.5em; margin: .75rem 0 0; }
 button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
@@ -122,11 +124,14 @@ button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); ou
     <div class="panel">
       <h2 data-i18n="homeTitle"></h2>
       <p class="muted" data-i18n="homeText"></p>
+      <label class="field-label" for="new-code" data-i18n="nameLabel"></label>
+      <input id="new-code" class="code-input" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="NANDO">
+      <p class="hint" data-i18n="nameHint"></p>
       <button type="button" class="primary wide" id="start" data-i18n="startNew"></button>
       <div class="join">
         <label for="join-code" data-i18n="joinLabel"></label>
         <div class="join-row">
-          <input id="join-code" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="K7Q2M">
+          <input id="join-code" class="code-input" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="K7Q2M">
           <button type="button" id="join" data-i18n="join"></button>
         </div>
       </div>
@@ -198,6 +203,10 @@ const I18N = {
     title: "Split the bill",
     homeTitle: "Split the bill with your table",
     homeText: "Start a bill, share the link in your group chat, and everyone adds what they had from their own phone.",
+    nameLabel: "Name this bill (optional)",
+    nameHint: "5 letters or numbers, like the restaurant or your group. Leave it empty for a random code.",
+    codeInvalid: "Codes are exactly 5 letters or numbers.",
+    codeTaken: "That code is already in use today. Join it below, or pick another name.",
     startNew: "Start a new bill",
     joinLabel: "Got a code? Join a bill",
     join: "Join",
@@ -242,6 +251,10 @@ const I18N = {
     title: "Dividir la cuenta",
     homeTitle: "Divide la cuenta con tu mesa",
     homeText: "Empieza una cuenta, comparte el enlace en el grupo y cada uno añade lo que consumió desde su móvil.",
+    nameLabel: "Ponle nombre a la cuenta (opcional)",
+    nameHint: "5 letras o números, como el restaurante o el grupo. Déjalo vacío para un código al azar.",
+    codeInvalid: "Los códigos tienen exactamente 5 letras o números.",
+    codeTaken: "Ese código ya se está usando hoy. Únete abajo o elige otro nombre.",
     startNew: "Empezar una cuenta nueva",
     joinLabel: "¿Tienes un código? Únete a una cuenta",
     join: "Unirse",
@@ -287,7 +300,7 @@ const I18N = {
 const API = "/api/bill";
 const POLL_MS = 3000;
 const SAVE_DELAY_MS = 600;
-const CODE_RE = /^[A-HJ-NP-Z2-9]{5}$/;
+const CODE_RE = /^[A-Z0-9]{5}$/;
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O or 1/I to avoid mix-ups
 const CURRENCIES = ["GBP", "EUR", "USD"];
 const $ = id => document.getElementById(id);
@@ -440,16 +453,27 @@ async function startBill() {
   $("start").disabled = true;
   $("home-error").textContent = "";
   const prefs = store.get("split-prefs") || {};
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const c = newCode();
+  const chosen = $("new-code").value.trim().toUpperCase();
+  if (chosen && !CODE_RE.test(chosen)) {
+    $("home-error").textContent = t("codeInvalid");
+    $("start").disabled = false;
+    return;
+  }
+  for (let attempt = 0; attempt < (chosen ? 1 : 3); attempt++) {
+    const c = chosen || newCode();
     try {
       const r = await fetch(API, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ code: c, action: "create", meta: { total: "", tip: prefs.tip ?? 12.5, currency: prefs.currency || "GBP" } })
       });
-      if (r.ok) { location.hash = c; return; }
-      if (r.status !== 409) break;          // 409 = code taken, try another
+      if (r.ok) { $("new-code").value = ""; location.hash = c; return; }
+      if (r.status === 409 && chosen) {     // their own name is in use today
+        $("home-error").textContent = t("codeTaken");
+        $("start").disabled = false;
+        return;
+      }
+      if (r.status !== 409) break;          // 409 on a random code: try another
     } catch (e) { break; }
   }
   $("home-error").textContent = t("offline");
@@ -459,7 +483,7 @@ async function startBill() {
 function joinBill() {
   const c = $("join-code").value.trim().toUpperCase();
   if (CODE_RE.test(c)) location.hash = c;
-  else $("home-error").textContent = t("notFound");
+  else $("home-error").textContent = t("codeInvalid");
 }
 
 async function shareBill() {
@@ -641,6 +665,11 @@ document.querySelectorAll("button[data-lang]").forEach(b => b.addEventListener("
 $("start").addEventListener("click", startBill);
 $("join").addEventListener("click", joinBill);
 $("join-code").addEventListener("keydown", e => { if (e.key === "Enter") joinBill(); });
+$("new-code").addEventListener("keydown", e => { if (e.key === "Enter") startBill(); });
+// codes are letters and numbers only, always in capitals
+document.querySelectorAll(".code-input").forEach(input => input.addEventListener("input", () => {
+  input.value = input.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5);
+}));
 $("share").addEventListener("click", shareBill);
 $("new-bill").addEventListener("click", () => { history.pushState(null, "", location.pathname); showHome(); });
 $("add-me").addEventListener("click", () => addPerson(true));

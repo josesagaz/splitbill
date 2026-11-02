@@ -3,7 +3,8 @@
 // never overwrite each other.
 import { getStore } from "@netlify/blobs";
 
-const CODE = /^[A-HJ-NP-Z2-9]{5}$/;
+const CODE = /^[A-Z0-9]{5}$/;
+const REUSE_AFTER_MS = 24 * 60 * 60 * 1000; // a code can be used again 24h after its bill started
 const ID = /^[a-z0-9]{8,20}$/;
 const CURRENCIES = ["GBP", "EUR", "USD"];
 const MAX_PEOPLE = 40;
@@ -50,7 +51,13 @@ export default async req => {
   const metaKey = `${code}/meta`;
 
   if (body.action === "create") {
-    if (await store.get(metaKey, { type: "json" })) return json({ error: "exists" }, 409);
+    const old = await store.get(metaKey, { type: "json" });
+    if (old) {
+      if (Date.now() - (old.createdAt || 0) < REUSE_AFTER_MS) return json({ error: "exists" }, 409);
+      // yesterday's bill with the same code: clear it out and start fresh
+      const { blobs } = await store.list({ prefix: `${code}/` });
+      await Promise.all(blobs.map(b => store.delete(b.key)));
+    }
     await store.setJSON(metaKey, { ...cleanMeta(body.meta), createdAt: Date.now() });
     return json({ ok: true });
   }
