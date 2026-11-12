@@ -76,6 +76,8 @@ input[type="text"] {
 .left { display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
 .you { background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 0 .55rem; font-size: .8rem; font-weight: 600; }
 .calc { color: var(--muted); font-variant-numeric: tabular-nums; }
+.person.invalid .calc { color: var(--danger); }
+input[aria-invalid="true"] { border-color: var(--danger); }
 .owes { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .owes strong { font-size: 1.15rem; }
 .empty { color: var(--muted); margin: 0; }
@@ -175,7 +177,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); ou
           <button type="button" data-currency="USD">$</button>
         </div>
       </div>
-      <input id="total" type="text" inputmode="decimal" autocomplete="off" placeholder="64.50">
+      <input id="total" type="text" inputmode="decimal" autocomplete="off" maxlength="120" placeholder="64.50">
     </section>
 
     <section class="panel">
@@ -241,7 +243,9 @@ const I18N = {
     notAllowed: "Only the person who started the bill can change that.",
     assignedSoFar: "Assigned so far",
     typeTotal: "Type the bill total to see what’s left",
-    summary: (total, withService, tip) => `of a ${total} bill, which comes to ${withService} with ${tip}% service`,
+    checkTotal: "Check the bill total, it isn’t a valid amount",
+    checkAmount: "Check this amount, it isn’t counted",
+    summary: (total, withService, tip) => `of a ${total} bill, which comes to ${withService} with ${tip} service`,
     loading: "Loading bill…",
     notFound: "We couldn’t find that bill. Check the code.",
     offline: "Can’t reach the server, trying again…",
@@ -293,7 +297,9 @@ const I18N = {
     notAllowed: "Solo quien empezó la cuenta puede cambiar eso.",
     assignedSoFar: "Asignado hasta ahora",
     typeTotal: "Escribe el total de la cuenta para ver lo que falta",
-    summary: (total, withService, tip) => `de una cuenta de ${total}, que queda en ${withService} con ${tip}% de servicio`,
+    checkTotal: "Revisa el total de la cuenta, no es un importe válido",
+    checkAmount: "Revisa este importe, no se está contando",
+    summary: (total, withService, tip) => `de una cuenta de ${total}, que queda en ${withService} con ${tip} de servicio`,
     loading: "Cargando la cuenta…",
     notFound: "No encontramos esa cuenta. Revisa el código.",
     offline: "No hay conexión con el servidor, reintentando…",
@@ -325,21 +331,55 @@ const randomFrom = (chars, n) => Array.from(crypto.getRandomValues(new Uint8Arra
 const newCode = () => randomFrom(ALPHABET, 5);
 const newId = (n = 12) => randomFrom("abcdefghijklmnopqrstuvwxyz0123456789", n);
 const newKey = () => newId(32);   // secret: proves "I'm the organiser" or "this row is mine"
-const clean = v => v.replace(/[^0-9.,+\/* ]/g, "");
-const num = s => { const n = parseFloat(String(s).replace(",", ".").replace(/[^0-9.]/g, "")); return isNaN(n) ? null : n; };
-// "12.50+11.25/3" = 12.50 + (11.25 ÷ 3). Unfinished bits like "11.25/" are ignored while typing.
+const MAX_AMOUNT_LEN = 120;     // the server keeps at most this many characters
+const clean = v => v.replace(/[^0-9.,+\/* ]/g, "").slice(0, MAX_AMOUNT_LEN);
+// One number, written either way: "1,234.50", "1.234,50", "12,50", "12.5", "1,234".
+// Returns NaN if it isn't a number (e.g. "12.50 4", where a space splits two numbers).
+function num(s) {
+  s = String(s).trim();
+  if (!/^[0-9.,]*[0-9][0-9.,]*$/.test(s)) return NaN;
+  const seps = s.match(/[.,]/g) || [];
+  const last = Math.max(s.lastIndexOf("."), s.lastIndexOf(","));
+  let whole = s, frac = "";
+  if (seps.length) {
+    const before = s.slice(0, last), after = s.slice(last + 1);
+    const sameSep = seps.every(c => c === seps[0]);
+    // "1,234,567" or "1,234": separators group thousands. Otherwise the last one is the decimal point.
+    const thousands = sameSep && /^\d{3}$/.test(after) && /^[1-9]\d{0,2}([.,]\d{3})*$/.test(before);
+    if (!thousands) {
+      // "1,234.50" / "1.234,50": earlier separators must be thousands groups of the *other* kind
+      if (seps.length > 1 && (!/^[1-9]\d{0,2}([.,]\d{3})+$/.test(before) || before.includes(s[last]))) return NaN;
+      whole = before; frac = after;
+    }
+  }
+  return Number(`${whole.replace(/[.,]/g, "") || "0"}.${frac || "0"}`);
+}
+// "12.50+11.25/3" = 12.50 + (11.25 ÷ 3). A trailing operator ("11.25/") is ignored while typing.
+// Returns NaN when the text can't be read, so it can be flagged instead of silently miscounted.
 function sumOf(text) {
-  return String(text || "").split("+").reduce((total, term) => {
+  const s = String(text || "").trim().replace(/[+\/*]\s*$/, "");
+  if (!s) return 0;
+  let total = 0;
+  for (const term of s.split("+")) {
     const parts = term.split(/([*\/])/);
     let value = num(parts[0]);
-    if (value === null) return total;
     for (let i = 1; i < parts.length; i += 2) {
       const n = num(parts[i + 1]);
-      if (n === null) continue;
-      if (parts[i] === "/") { if (n !== 0) value /= n; } else value *= n;
+      if (parts[i] === "/") value = n === 0 ? NaN : value / n; else value *= n;
     }
-    return total + value;
-  }, 0);
+    total += value;
+  }
+  return Number.isFinite(total) ? total : NaN;
+}
+// Round each share to the penny so the shares add up exactly to `targetCents`
+// (largest-remainder method: leftover pennies go to the biggest fractions).
+function splitCents(amounts, targetCents) {
+  const raw = amounts.map(a => Math.round(a * 100 * 1e6) / 1e6);
+  const cents = raw.map(Math.floor);
+  let left = targetCents - cents.reduce((a, b) => a + b, 0);
+  const order = raw.map((r, i) => [r - cents[i], i]).sort((a, b) => b[0] - a[0]);
+  for (let k = 0; left > 0 && order.length; k = (k + 1) % order.length, left--) cents[order[k][1]]++;
+  return cents;
 }
 
 // ---------- Language (per phone) ----------
@@ -360,7 +400,8 @@ let owned = {};                  // rows this phone created: { personId: ownerKe
 const isOrganiser = () => !!adminKey;
 const canEdit = id => isOrganiser() || !!owned[id];
 
-const fmt = n => n.toLocaleString("en-GB", { style: "currency", currency: meta.currency, currencyDisplay: "narrowSymbol" });
+const fmt = n => n.toLocaleString(t("htmlLang"), { style: "currency", currency: meta.currency, currencyDisplay: "narrowSymbol" });
+const fmtPct = n => (n / 100).toLocaleString(t("htmlLang"), { style: "percent", maximumFractionDigits: 1 });
 
 async function post(body) {
   const r = await fetch(API, {
@@ -559,7 +600,7 @@ function makeRow(id) {
       <label class="sr" data-role="ini-label" for="in-${id}"></label>
       <input class="initials" id="in-${id}" type="text" maxlength="3" autocomplete="off">
       <label class="sr" data-role="sp-label" for="sp-${id}"></label>
-      <input class="spent" id="sp-${id}" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00">
+      <input class="spent" id="sp-${id}" type="text" inputmode="decimal" autocomplete="off" maxlength="120" placeholder="0.00">
       <button type="button" class="plus">+</button>
       <button type="button" class="divide">÷</button>
     </div>
@@ -586,7 +627,7 @@ function makeRow(id) {
   const addOperator = op => {
     const p = find(); if (!p) return;
     const v = p.spent.trim();
-    if (v && !/[+\/*]$/.test(v)) p.spent = v + op;
+    if (v && !/[+\/*]$/.test(v)) p.spent = (v + op).slice(0, MAX_AMOUNT_LEN);
     sp.value = p.spent; sp.focus();
     queueSave(id); render();
   };
@@ -601,7 +642,16 @@ function render() {
   const factor = 1 + meta.tip / 100;
   const box = $("rows");
   const existing = new Map([...box.children].map(el => [el.dataset.id, el]));
-  let assigned = 0;
+
+  // Work out the money first, so each share is rounded to the penny and the shares add up exactly.
+  const spentList = people.map(p => sumOf(p.spent));
+  const valid = spentList.map(s => (Number.isNaN(s) ? 0 : s));
+  const assigned = valid.reduce((a, b) => a + b, 0);
+  const total = sumOf(meta.total);
+  const left = Number.isNaN(total) ? NaN : Math.round((total - assigned) * 100) / 100;
+  // When everything's assigned, the shares add up to the bill-with-service shown in the summary.
+  const targetCents = Math.round((total && left === 0 ? total : assigned) * factor * 100);
+  const owedCents = splitCents(valid.map(s => s * factor), targetCents);
 
   people.forEach((p, i) => {
     let row = existing.get(p.id);
@@ -627,14 +677,16 @@ function render() {
     row.querySelector(".divide").setAttribute("aria-label", t("divideItem")(n));
     row.querySelector(".remove").setAttribute("aria-label", t("removePerson")(n));
 
-    const spent = sumOf(p.spent);
-    assigned += spent;
+    const spent = spentList[i];
+    const bad = Number.isNaN(spent);
+    row.classList.toggle("invalid", bad);
+    sp.setAttribute("aria-invalid", String(bad));
     const you = row.querySelector(".you");
     you.hidden = p.id !== meId; you.textContent = t("you");
-    row.querySelector(".calc").textContent = /[+\/*]/.test(p.spent)
+    row.querySelector(".calc").textContent = bad ? t("checkAmount") : /[+\/*]/.test(p.spent)
       ? `${p.spent.replace(/\s+/g, "").replace(/[+\/*]+$/, "").replace(/\+/g, " + ").replace(/\//g, " ÷ ").replace(/\*/g, " × ")} = ${fmt(spent)}` : "";
     row.querySelector(".owes-word").textContent = t("owes");
-    row.querySelector(".owes strong").textContent = fmt(spent * factor);
+    row.querySelector(".owes strong").textContent = bad ? "–" : fmt(owedCents[i] / 100);
   });
   existing.forEach(el => el.remove());
 
@@ -647,24 +699,23 @@ function render() {
   const totalInput = $("total");
   if (document.activeElement !== totalInput && totalInput.value !== meta.total) totalInput.value = meta.total;
 
-  const total = sumOf(meta.total);
+  totalInput.setAttribute("aria-invalid", String(Number.isNaN(total)));
   const hero = $("hero");
   hero.classList.remove("over", "done");
-  if (!total) {
+  if (!total || Number.isNaN(total)) {
     $("hero-label").textContent = t("assignedSoFar");
     hero.textContent = fmt(assigned);
-    $("summary").textContent = t("typeTotal");
+    $("summary").textContent = Number.isNaN(total) ? t("checkTotal") : t("typeTotal");
   } else {
-    const left = Math.round((total - assigned) * 100) / 100;
     if (left > 0) { $("hero-label").textContent = t("leftToAssign"); hero.textContent = fmt(left); }
     else if (left < 0) { $("hero-label").textContent = t("overBy"); hero.textContent = fmt(-left); hero.classList.add("over"); }
     else { $("hero-label").textContent = t("allAssigned"); hero.textContent = fmt(0); hero.classList.add("done"); }
     $("summary").textContent = left === 0 && people.length
       ? t("readyToPay")
-      : t("summary")(fmt(total), fmt(total * factor), meta.tip);
+      : t("summary")(fmt(total), fmt(Math.round(total * factor * 100) / 100), fmtPct(meta.tip));
   }
 
-  $("tip").textContent = meta.tip ? meta.tip + "%" : t("none");
+  $("tip").textContent = meta.tip ? fmtPct(meta.tip) : t("none");
   $("tip-down").disabled = !isOrganiser() || meta.tip <= 0;
   $("tip-up").disabled = !isOrganiser() || meta.tip >= 30;
   document.querySelectorAll("#currency button").forEach(b => {
