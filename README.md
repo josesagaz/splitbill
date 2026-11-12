@@ -25,6 +25,6 @@ No build command needed. Every push redeploys.
 ## Try it locally
 
     npm install
-    npx netlify dev         # opens http://localhost:8888 with the function + a local blob store
+    npm run dev             # opens http://localhost:8888 with the function + a local blob store
 
 Netlify Blobs needs no setup or keys; it's switched on automatically for functions.
